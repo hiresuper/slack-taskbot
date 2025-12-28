@@ -1,0 +1,17 @@
+{
+  "name": "slack-tasks-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.19.0",
+    "airtable": "^0.12.2",
+    "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3",
+    "openai": "^4.56.0"
+  }
+}
