@@ -76,7 +76,7 @@ function parseRemindDurationHours(text) {
   if (!text) return null;
   const t = text.toLowerCase();
 
-  // Match: "remind in 6 hours", "remind in 90 minutes", "remind in 2 days"
+  // "remind in 6 hours", "remind in 90 minutes", "remind in 2 days"
   const m = t.match(/remind\s+in\s+(\d+)\s*(minute|minutes|min|hour|hours|hr|hrs|day|days)\b/);
   if (!m) return null;
 
@@ -147,9 +147,7 @@ function extractAssigneeSlackId(threadMessages, requesterId) {
   for (const m of threadMessages) {
     let match;
     while ((match = regex.exec(m.text || ""))) {
-      if (!ignore.has(match[1])) {
-        counts.set(match[1], (counts.get(match[1]) || 0) + 1);
-      }
+      if (!ignore.has(match[1])) counts.set(match[1], (counts.get(match[1]) || 0) + 1);
     }
   }
 
@@ -220,23 +218,8 @@ async function postInThread(channel, thread_ts, text) {
   await app.client.chat.postMessage({ channel, thread_ts, text });
 }
 
-function nextReminderISO(hoursOrFrom = REMINDER_INTERVAL_HOURS, from = new Date()) {
-  // Supports:
-  // 1) nextReminderISO()  -> uses default REMINDER_INTERVAL_HOURS from "now"
-  // 2) nextReminderISO(nowDate) -> uses default hours from that date
-  // 3) nextReminderISO(hours) -> from now
-  // 4) nextReminderISO(hours, nowDate) -> explicit
-  let hours = REMINDER_INTERVAL_HOURS;
-  let baseDate = from;
-
-  if (hoursOrFrom instanceof Date) {
-    baseDate = hoursOrFrom;
-  } else if (typeof hoursOrFrom === "number" && Number.isFinite(hoursOrFrom)) {
-    hours = hoursOrFrom;
-  }
-
-  const out = new Date(baseDate.getTime() + hours * 3600_000);
-  return out.toISOString();
+function nextReminderISO(from = new Date()) {
+  return new Date(from.getTime() + REMINDER_INTERVAL_HOURS * 3600_000).toISOString();
 }
 
 function makeTaskId() {
@@ -264,7 +247,6 @@ app.event("app_mention", async ({ event }) => {
       return;
     }
 
-    /* ---- SUMMARY ---- */
     if (cmd === "summary") {
       const rec = await airtableFindByThreadTs(threadTs);
       if (!rec) return postInThread(channelId, threadTs, "Nothing tracked yet.");
@@ -276,7 +258,6 @@ app.event("app_mention", async ({ event }) => {
       return;
     }
 
-    /* ---- UPDATE ---- */
     if (cmd === "update") {
       const rec = await airtableFindByThreadTs(threadTs);
       if (!rec) return postInThread(channelId, threadTs, "Nothing tracked yet.");
@@ -308,7 +289,6 @@ app.event("app_mention", async ({ event }) => {
       return;
     }
 
-    /* ---- TRACK ---- */
     if (cmd === "track") {
       if (await airtableFindByThreadTs(threadTs)) {
         return postInThread(channelId, threadTs, "Already tracked.");
@@ -327,10 +307,9 @@ app.event("app_mention", async ({ event }) => {
         source_link: slackMessageLink(channelId, threadTs),
         created_by_slack_id: event.user,
         created_at: new Date().toISOString(),
-        next_reminder_at: nextReminderISO(REMINDER_INTERVAL_HOURS),
-        reminder_interval_hours: REMINDER_INTERVAL_HOURS,
+        next_reminder_at: nextReminderISO(),
         reminder_count: 0,
-        one_off_reminder_at: "", // TEXT FIELD in Airtable; empty means none scheduled
+        one_off_reminder_at: "", // TEXT field recommended
         ...ai,
         assignee_slack_id: assigneeId,
         assignee_display,
@@ -341,7 +320,6 @@ app.event("app_mention", async ({ event }) => {
       return;
     }
 
-    /* ---- LIST ---- */
     if (cmd === "list") {
       const open = await airtableListOpenTasks(10);
 
@@ -365,7 +343,6 @@ app.event("app_mention", async ({ event }) => {
       return;
     }
 
-    /* ---- REMIND (ONE-OFF) ---- */
     if (cmd === "remind") {
       const rec = await airtableFindByThreadTs(threadTs);
       if (!rec) return postInThread(channelId, threadTs, "No tracked task yet. Use *@tasks track* first.");
@@ -376,7 +353,6 @@ app.event("app_mention", async ({ event }) => {
         return;
       }
 
-      // Store ISO string in a TEXT field
       const whenISO = new Date(Date.now() + hours * 3600_000).toISOString();
 
       await airtableUpdate(rec.id, {
@@ -388,18 +364,14 @@ app.event("app_mention", async ({ event }) => {
       return;
     }
 
-    /* ---- REOPEN ---- */
     if (cmd === "reopen") {
       const rec = await airtableFindByThreadTs(threadTs);
       if (!rec) return;
 
-      const intervalHours = Number(rec.fields.reminder_interval_hours || REMINDER_INTERVAL_HOURS);
       const now = new Date();
-
       await airtableUpdate(rec.id, {
         status: "open",
-        reminder_interval_hours: intervalHours,
-        next_reminder_at: nextReminderISO(intervalHours, now),
+        next_reminder_at: nextReminderISO(now),
         last_update_at: now.toISOString()
       });
 
@@ -407,7 +379,6 @@ app.event("app_mention", async ({ event }) => {
       return;
     }
 
-    /* ---- COMPLETE ---- */
     if (cmd === "complete") {
       const rec = await airtableFindByThreadTs(threadTs);
       if (!rec) return;
@@ -463,11 +434,10 @@ cron.schedule(`*/${CRON_EVERY_MINUTES} * * * *`, async () => {
       );
 
       const firedOneOff = !!(oneOffOk && oneOffDue <= now);
-      const intervalHours = Number(rec.fields.reminder_interval_hours || REMINDER_INTERVAL_HOURS);
 
       await airtableUpdate(rec.id, {
         reminder_count: Number(rec.fields.reminder_count || 0) + 1,
-        next_reminder_at: nextReminderISO(intervalHours, now),
+        next_reminder_at: nextReminderISO(now),
         one_off_reminder_at: firedOneOff ? "" : (rec.fields.one_off_reminder_at || ""),
         last_update_at: now.toISOString()
       });
