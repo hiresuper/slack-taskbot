@@ -25,9 +25,9 @@ for (const k of requiredEnv) {
    CONFIG
 ===================== */
 
-const REMINDER_INTERVAL_HOURS = 24;
+const REMINDER_INTERVAL_HOURS = 24; // default recurring cadence
 const CRON_EVERY_MINUTES = 30;
-const MAX_REMINDERS = 0;
+const MAX_REMINDERS = 0; // 0 = unlimited
 
 /* =====================
    CLIENTS
@@ -91,6 +91,10 @@ function parseRemindDurationHours(text) {
   return null;
 }
 
+function isValidDate(d) {
+  return d instanceof Date && !Number.isNaN(d.getTime());
+}
+
 async function airtableFindByThreadTs(threadTs) {
   const records = await airtableBase(TASKS_TABLE)
     .select({
@@ -129,7 +133,6 @@ async function airtableListOpenTasks(limit = 20) {
     .firstPage();
   return records || [];
 }
-
 
 /* =====================
    ASSIGNEE LOGIC
@@ -197,9 +200,7 @@ ${text}
     const parsed = JSON.parse(raw);
     return {
       summary: parsed.summary?.trim() || "",
-      next_actions: typeof parsed.next_actions === "string"
-        ? parsed.next_actions.trim()
-        : "",
+      next_actions: typeof parsed.next_actions === "string" ? parsed.next_actions.trim() : "",
       task_title: parsed.task_title?.trim() || ""
     };
   } catch {
@@ -219,13 +220,23 @@ async function postInThread(channel, thread_ts, text) {
   await app.client.chat.postMessage({ channel, thread_ts, text });
 }
 
-function nextReminderISO(hours, from = new Date()) {
-  return new Date(from.getTime() + hours * 3600_000).toISOString();
-}
+function nextReminderISO(hoursOrFrom = REMINDER_INTERVAL_HOURS, from = new Date()) {
+  // Supports:
+  // 1) nextReminderISO()  -> uses default REMINDER_INTERVAL_HOURS from "now"
+  // 2) nextReminderISO(nowDate) -> uses default hours from that date
+  // 3) nextReminderISO(hours) -> from now
+  // 4) nextReminderISO(hours, nowDate) -> explicit
+  let hours = REMINDER_INTERVAL_HOURS;
+  let baseDate = from;
 
+  if (hoursOrFrom instanceof Date) {
+    baseDate = hoursOrFrom;
+  } else if (typeof hoursOrFrom === "number" && Number.isFinite(hoursOrFrom)) {
+    hours = hoursOrFrom;
+  }
 
-function addHoursISO(hours, from = new Date()) {
-  return new Date(from.getTime() + hours * 3600_000).toISOString();
+  const out = new Date(baseDate.getTime() + hours * 3600_000);
+  return out.toISOString();
 }
 
 function makeTaskId() {
@@ -248,7 +259,7 @@ app.event("app_mention", async ({ event }) => {
       await postInThread(
         channelId,
         threadTs,
-        `Commands:\n• track\n• update\n• summary\n• complete\n• reopen\n• list`
+        `Commands:\n• track\n• update\n• summary\n• complete\n• reopen\n• list\n• remind in X hours`
       );
       return;
     }
@@ -316,8 +327,10 @@ app.event("app_mention", async ({ event }) => {
         source_link: slackMessageLink(channelId, threadTs),
         created_by_slack_id: event.user,
         created_at: new Date().toISOString(),
-        next_reminder_at: nextReminderISO(),
+        next_reminder_at: nextReminderISO(REMINDER_INTERVAL_HOURS),
+        reminder_interval_hours: REMINDER_INTERVAL_HOURS,
         reminder_count: 0,
+        one_off_reminder_at: "", // TEXT FIELD in Airtable; empty means none scheduled
         ...ai,
         assignee_slack_id: assigneeId,
         assignee_display,
@@ -329,64 +342,67 @@ app.event("app_mention", async ({ event }) => {
     }
 
     /* ---- LIST ---- */
-if (cmd === "list") {
-  const open = await airtableListOpenTasks(10);
+    if (cmd === "list") {
+      const open = await airtableListOpenTasks(10);
 
-  if (!open.length) {
-    await postInThread(channelId, threadTs, "✅ No open tasks right now.");
-    return;
-  }
+      if (!open.length) {
+        await postInThread(channelId, threadTs, "✅ No open tasks right now.");
+        return;
+      }
 
-  const lines = open.map((r, i) => {
-    const title = r.fields.task_title || r.fields.task_id || "Untitled";
-    const who = r.fields.assignee_display ? ` — ${r.fields.assignee_display}` : "";
-    const link = r.fields.source_link ? ` (${r.fields.source_link})` : "";
-    return `${i + 1}) *${title}*${who}${link}`;
-  });
+      const lines = open.map((r, i) => {
+        const title = r.fields.task_title || r.fields.task_id || "Untitled";
+        const who = r.fields.assignee_display ? ` — ${r.fields.assignee_display}` : "";
+        const link = r.fields.source_link ? ` (${r.fields.source_link})` : "";
+        return `${i + 1}) *${title}*${who}${link}`;
+      });
 
-  await postInThread(
-    channelId,
-    threadTs,
-    `📋 *Open tasks (${open.length})*\n` + lines.join("\n") + `\n\nTip: reply in a task thread with *@tasks summary* to get context.`
-  );
-  return;
-}
+      await postInThread(
+        channelId,
+        threadTs,
+        `📋 *Open tasks (${open.length})*\n${lines.join("\n")}\n\nTip: reply in a task thread with *@tasks summary* to get context.`
+      );
+      return;
+    }
 
-   /* ---- REMIND ---- */
-if (cmd === "remind") {
-  const rec = await airtableFindByThreadTs(threadTs);
-  if (!rec) return postInThread(channelId, threadTs, "No tracked task yet. Use *@tasks track* first.");
+    /* ---- REMIND (ONE-OFF) ---- */
+    if (cmd === "remind") {
+      const rec = await airtableFindByThreadTs(threadTs);
+      if (!rec) return postInThread(channelId, threadTs, "No tracked task yet. Use *@tasks track* first.");
 
-  const hours = parseRemindDurationHours(event.text || "");
-if (!hours) {
-  await postInThread(channelId, threadTs, "Usage: *@tasks remind in 6 hours*");
-  return;
-}
+      const hours = parseRemindDurationHours(event.text || "");
+      if (!hours) {
+        await postInThread(channelId, threadTs, "Usage: *@tasks remind in 6 hours* (also supports minutes/days)");
+        return;
+      }
 
-const whenDate = new Date(Date.now() + hours * 3600_000);
+      // Store ISO string in a TEXT field
+      const whenISO = new Date(Date.now() + hours * 3600_000).toISOString();
 
-const whenISO = new Date(Date.now() + hours * 3600_000).toISOString();
+      await airtableUpdate(rec.id, {
+        one_off_reminder_at: whenISO,
+        last_update_at: new Date().toISOString()
+      });
 
-await airtableUpdate(rec.id, {
-  one_off_reminder_at: whenISO,
-  last_update_at: new Date().toISOString()
-});
-
-
-
-  await postInThread(channelId, threadTs, `⏰ Got it — I’ll send an extra reminder in ${hours} hour(s).`);
-  return;
-}
-
+      await postInThread(channelId, threadTs, `⏰ Got it — I’ll send an extra reminder in ${hours} hour(s).`);
+      return;
+    }
 
     /* ---- REOPEN ---- */
     if (cmd === "reopen") {
       const rec = await airtableFindByThreadTs(threadTs);
       if (!rec) return;
+
+      const intervalHours = Number(rec.fields.reminder_interval_hours || REMINDER_INTERVAL_HOURS);
+      const now = new Date();
+
       await airtableUpdate(rec.id, {
         status: "open",
-        next_reminder_at: nextReminderISO()
+        reminder_interval_hours: intervalHours,
+        next_reminder_at: nextReminderISO(intervalHours, now),
+        last_update_at: now.toISOString()
       });
+
       await postInThread(channelId, threadTs, `♻️ Reopened *${rec.fields.task_title}*.`);
       return;
     }
@@ -395,10 +411,14 @@ await airtableUpdate(rec.id, {
     if (cmd === "complete") {
       const rec = await airtableFindByThreadTs(threadTs);
       if (!rec) return;
+
       await airtableUpdate(rec.id, {
         status: "closed",
-        next_reminder_at: null
+        next_reminder_at: "",
+        one_off_reminder_at: "",
+        last_update_at: new Date().toISOString()
       });
+
       await postInThread(channelId, threadTs, `✅ Closed *${rec.fields.task_title}*.`);
       return;
     }
@@ -411,7 +431,6 @@ await airtableUpdate(rec.id, {
    REMINDERS
 ===================== */
 
-// --- Reminder scheduler ---
 cron.schedule(`*/${CRON_EVERY_MINUTES} * * * *`, async () => {
   try {
     const now = new Date();
@@ -423,43 +442,40 @@ cron.schedule(`*/${CRON_EVERY_MINUTES} * * * *`, async () => {
     for (const rec of records) {
       if (MAX_REMINDERS && Number(rec.fields.reminder_count || 0) >= MAX_REMINDERS) continue;
 
-      // Normal recurring reminder
       const normalDue = rec.fields.next_reminder_at ? new Date(rec.fields.next_reminder_at) : null;
+      const oneOffDue = rec.fields.one_off_reminder_at ? new Date(rec.fields.one_off_reminder_at) : null;
 
-// One-off reminder set by "@tasks remind in X hours"
-const oneOffDue = rec.fields.one_off_reminder_at
-  ? new Date(rec.fields.one_off_reminder_at)
-  : null;
+      const normalOk = isValidDate(normalDue);
+      const oneOffOk = isValidDate(oneOffDue);
 
-const nextDue =
-  normalDue && oneOffDue
-    ? (normalDue < oneOffDue ? normalDue : oneOffDue)
-    : (oneOffDue || normalDue);
+      const nextDue =
+        normalOk && oneOffOk ? (normalDue < oneOffDue ? normalDue : oneOffDue)
+        : oneOffOk ? oneOffDue
+        : normalOk ? normalDue
+        : null;
 
-if (!nextDue || nextDue > now) continue;
+      if (!nextDue || nextDue > now) continue;
 
-await postInThread(
-  rec.fields.channel_id,
-  rec.fields.thread_ts,
-  `⏰ Reminder: *${rec.fields.task_title || rec.fields.task_id}* is still open. Close with *@tasks complete* when done.`
-);
+      await postInThread(
+        rec.fields.channel_id,
+        rec.fields.thread_ts,
+        `⏰ Reminder: *${rec.fields.task_title || rec.fields.task_id}* is still open. Close with *@tasks complete* when done.`
+      );
 
-const firedOneOff = !!(oneOffDue && oneOffDue <= now);
-const intervalHours = Number(rec.fields.reminder_interval_hours || REMINDER_INTERVAL_HOURS);
+      const firedOneOff = !!(oneOffOk && oneOffDue <= now);
+      const intervalHours = Number(rec.fields.reminder_interval_hours || REMINDER_INTERVAL_HOURS);
 
-await airtableUpdate(rec.id, {
-  reminder_count: Number(rec.fields.reminder_count || 0) + 1,
-  next_reminder_at: nextReminderISO(intervalHours, now),
-  one_off_reminder_at: firedOneOff ? "" : (rec.fields.one_off_reminder_at || ""),
-  last_update_at: now.toISOString()
-});
-
+      await airtableUpdate(rec.id, {
+        reminder_count: Number(rec.fields.reminder_count || 0) + 1,
+        next_reminder_at: nextReminderISO(intervalHours, now),
+        one_off_reminder_at: firedOneOff ? "" : (rec.fields.one_off_reminder_at || ""),
+        last_update_at: now.toISOString()
+      });
     }
   } catch (err) {
     console.error("Reminder cron error:", err);
   }
 });
-
 
 /* =====================
    START
