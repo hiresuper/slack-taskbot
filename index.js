@@ -385,7 +385,6 @@ app.event("app_mention", async ({ event }) => {
 
       await airtableUpdate(rec.id, {
         status: "closed",
-        next_reminder_at: "",
         one_off_reminder_at: "",
         last_update_at: new Date().toISOString()
       });
